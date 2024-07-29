@@ -20,7 +20,7 @@ from typing import Dict, List, Optional, Tuple, Union
 os_amis = {
     'ubuntu18_04': "ami-078eece1d8119409f",  # login_name: ubuntu
     'ubuntu20_04': "ami-052eac90edaa9d08f",  # login_name: ubuntu
-    'ubuntu22_04': "ami-0c6c29c5125214c77",  # login_name: ubuntu
+    'ubuntu22_04': "ami-05cc25bfa725a144a",  # login_name: ubuntu, region: us-west-2
     'redhat8': "ami-0698b90665a2ddcf1",  # login_name: ec2-user
 }
 ubuntu18_04_ami = os_amis['ubuntu18_04']
@@ -44,7 +44,7 @@ def ec2_get_instances(filter_name, filter_value):
     return ec2.instances.filter(Filters=[{'Name': filter_name, 'Values': [filter_value]}])
 
 
-def ec2_instances_of_type(instance_type='t4g.2xlarge'):
+def ec2_instances_of_type(instance_type='c7g.4xlarge'):
     return ec2_get_instances('instance-type', instance_type)
 
 
@@ -53,10 +53,10 @@ def ec2_instances_by_id(instance_id):
     return rc[0] if len(rc) > 0 else None
 
 
-def start_instance(key_name, ami=ubuntu18_04_ami, instance_type='t4g.2xlarge'):
+def start_instance(key_name, ami=ubuntu18_04_ami, instance_type='c7g.4xlarge'):
     inst = ec2.create_instances(ImageId=ami,
                                 InstanceType=instance_type,
-                                SecurityGroups=['ssh-allworld'],
+                                SecurityGroups=['default'],
                                 KeyName=key_name,
                                 MinCount=1,
                                 MaxCount=1,
@@ -229,8 +229,9 @@ def build_ArmComputeLibrary(host: RemoteHost, git_clone_flags: str = "") -> None
     print('Building Arm Compute Library')
     acl_build_flags=" ".join(["debug=0", "neon=1", "opencl=0", "os=linux", "openmp=1", "cppthreads=0",
                               "arch=armv8a", "multi_isa=1", "fixed_format_kernels=1", "build=native"])
-    host.run_cmd(f"git clone https://github.com/ARM-software/ComputeLibrary.git -b v24.04 {git_clone_flags}")
-    host.run_cmd(f"cd ComputeLibrary && scons Werror=1 -j8 {acl_build_flags}")
+    host.run_cmd(f"git clone https://review.mlplatform.org/ml/ComputeLibrary {git_clone_flags} && cd $HOME/ComputeLibrary && git checkout c2237ec4094c7824f8f7e61bc89504d01c5b59ff")
+    host.run_cmd("cd ComputeLibrary/ && git apply $HOME/pytorch/acl_stateless_matmul.patch")  # Not applying the static quant patch
+    host.run_cmd(f"cd ComputeLibrary/ && scons Werror=0 -j16 {acl_build_flags}")
 
 
 def embed_libgomp(host: RemoteHost, use_conda, wheel_name) -> None:
@@ -508,7 +509,7 @@ def start_build(host: RemoteHost, *,
                 python_version: str = "3.8",
                 pytorch_only: bool = False,
                 pytorch_build_number: Optional[str] = None,
-                shallow_clone: bool = True,
+                shallow_clone: bool = False,
                 enable_mkldnn: bool = False) -> Tuple[str, str, str, str, str]:
     git_clone_flags = " --depth 1 --shallow-submodules" if shallow_clone else ""
     if host.using_docker() and not use_conda:
@@ -529,15 +530,20 @@ def start_build(host: RemoteHost, *,
         # HACK: pypa gforntran.a is compiled without PIC, which leads to the following error
         # libgfortran.a(error.o)(.text._gfortrani_st_printf+0x34): unresolvable R_AARCH64_ADR_PREL_PG_HI21 relocation against symbol `__stack_chk_guard@@GLIBC_2.17'  # noqa: E501
         # Workaround by copying gfortran library from the host
-        host.run_ssh_cmd("sudo apt-get install -y gfortran-8")
-        host.run_cmd("mkdir -p /usr/lib/gcc/aarch64-linux-gnu/8")
-        host.run_ssh_cmd(["docker", "cp", "/usr/lib/gcc/aarch64-linux-gnu/8/libgfortran.a",
+        host.run_ssh_cmd("sudo apt-get install -y gfortran")
+        host.run_cmd("mkdir -p /usr/lib/gcc/aarch64-linux-gnu/11")
+        host.run_ssh_cmd(["docker", "cp", "/usr/lib/gcc/aarch64-linux-gnu/11/libgfortran.a",
                          f"{host.container_id}:/opt/rh/devtoolset-10/root/usr/lib/gcc/aarch64-redhat-linux/10/"
                           ])
 
     print('Checking out PyTorch repo')
-    host.run_cmd(f"git clone --recurse-submodules -b {branch} https://github.com/pytorch/pytorch {git_clone_flags}")
+    # host.run_cmd(f"git clone --recurse-submodules -b {branch} https://github.com/pytorch/pytorch {git_clone_flags}")
+    host.run_cmd(f"git clone --recurse-submodules -b {branch} https://github.com/Rohanjames1997/pytorch.git")
+    # host.run_cmd("cd $HOME/pytorch/third_party/ideep && git checkout 55ca0191687aaf19aca5cdb7881c791e3bea442b && git apply $HOME/pytorch/ideep_dynamic_quantization.patch && git apply $HOME/pytorch/ideep_static_quantization.patch")
 
+    host.run_cmd("cd $HOME/pytorch/third_party/ideep/mkl-dnn && git checkout v3.5")
+    host.run_cmd("patches=(onednn.patch onednn_acl_thread_local_scheduler.patch onednn_stateless_matmul.patch) && for patch in ${patches[@]}; \
+                    do cd $HOME/pytorch/third_party/ideep/mkl-dnn/ && git apply $HOME/pytorch/$patch;done")  # Not applying onednn_static_quantization.patch
     print('Building PyTorch wheel')
     build_opts = ""
     if pytorch_build_number is not None:
@@ -706,14 +712,14 @@ def parse_arguments():
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--build-only", action="store_true")
     parser.add_argument("--test-only", type=str)
-    parser.add_argument("--os", type=str, choices=list(os_amis.keys()), default='ubuntu20_04')
+    parser.add_argument("--os", type=str, choices=list(os_amis.keys()), default='ubuntu22_04')
     parser.add_argument("--python-version", type=str, choices=[f'3.{d}' for d in range(6, 12)], default=None)
     parser.add_argument("--alloc-instance", action="store_true")
     parser.add_argument("--list-instances", action="store_true")
     parser.add_argument("--pytorch-only", action="store_true")
     parser.add_argument("--keep-running", action="store_true")
     parser.add_argument("--terminate-instances", action="store_true")
-    parser.add_argument("--instance-type", type=str, default="t4g.2xlarge")
+    parser.add_argument("--instance-type", type=str, default="c7g.4xlarge")
     parser.add_argument("--branch", type=str, default="master")
     parser.add_argument("--use-docker", action="store_true")
     parser.add_argument("--compiler", type=str, choices=['gcc-7', 'gcc-8', 'gcc-9', 'clang'], default="gcc-8")
